@@ -5,7 +5,7 @@ Each player holds a coloured pen (or marker) up to the webcam and moves it
 up/down to control their paddle.  No hand-tracking, no skin detection —
 just vivid colour blobs.
 
-  P1 (left paddle)  — ORANGE / RED pen      default hue 5–22
+  P1 (left paddle)  — RED pen               default hue 0–10
   P2 (right paddle) — BLUE pen              default hue 100–125
 
 Both players can move anywhere on screen; there is no left/right split.
@@ -18,6 +18,14 @@ Tuning keys (if the pen isn't being picked up):
 
 import cv2
 import numpy as np
+from collections import deque
+import threading
+import winsound
+
+def _beep(freq, ms): threading.Thread(target=winsound.Beep, args=(freq, ms), daemon=True).start()
+def sound_paddle(): _beep(480, 25)
+def sound_wall():   _beep(280, 20)
+def sound_score():  _beep(160, 180)
 
 # ── Windows ───────────────────────────────────────────────────────────────────
 GAME_W, GAME_H = 800, 600
@@ -27,20 +35,13 @@ GAME_WIN       = "Pong"
 CAM_WIN        = "Pen Tracking  (Q/A = P1 hue   P/L = P2 hue)"
 
 # ── Colours (BGR) ─────────────────────────────────────────────────────────────
-BLACK       = (0,   0,   0)
-WHITE       = (255, 255, 255)
-GREY        = (60,  60,  60)
-GREY_LIGHT  = (130, 130, 130)
-GREEN       = (0,   210, 90)
-GREEN_DARK  = (0,   90,  30)
-GREEN_FIELD = (0,   55,  20)
-RED         = (50,  50,  210)
-RED_DARK    = (30,  20,  100)
-RED_FIELD   = (30,  15,  70)
-YELLOW      = (0,   220, 220)
-ORANGE_BGR  = (0,   140, 255)   # display colour for P1 pen hint
-BLUE_BGR    = (220, 100, 50)    # display colour for P2 pen hint
-BORDER_COL  = (18,  18,  18)
+WHITE        = (255, 255, 255)
+GREY_LIGHT   = (130, 130, 130)
+ORANGE_BGR   = (0,   140, 255)   # P1 — matches orange pen
+ORANGE_FIELD = (0,    40,  80)   # dark orange tint for P1 field half
+BLUE_BGR     = (220, 100,  50)   # P2 — matches blue pen
+BLUE_FIELD   = (80,   30,  10)   # dark blue tint for P2 field half
+BORDER_COL   = (18,   18,  18)
 
 # ── Paddle ────────────────────────────────────────────────────────────────────
 PADDLE_W      = 14
@@ -68,26 +69,28 @@ SERVE_ANGLE  = 28
 WINNING_SCORE = 7
 
 # ── Pen colour defaults (HSV, OpenCV scale: H 0-180, S/V 0-255) ──────────────
-# P1 — orange/warm pen
-P1_HUE_LOW  = 5
-P1_HUE_HIGH = 22     # press Q to raise, A to lower
-P1_SAT_LOW  = 130    # high saturation: pen caps are vivid
-P1_VAL_LOW  = 80
+# P1 — red pen (hue 0-10 + wrap-around 160-180, both caught automatically)
+P1_HUE_LOW  = 0
+P1_HUE_HIGH = 15     # press Q to raise, A to lower
+P1_SAT_LOW  = 120    # high enough to reject most skin, low enough to catch red markers
+P1_VAL_LOW  = 60
 
 # P2 — blue pen
 P2_HUE_LOW  = 100
 P2_HUE_HIGH = 125    # press P to raise, L to lower
-P2_SAT_LOW  = 130
-P2_VAL_LOW  = 80
+P2_SAT_LOW  = 120    # blue doesn't overlap skin so can be a bit looser
+P2_VAL_LOW  = 60
 
 # Pen blob size limits (pen tips are small — much tighter than palm limits)
 MIN_PEN_AREA = 80     # px²  — ignore tiny specks
 MAX_PEN_AREA = 8000   # px²  — ignore large blobs that are definitely not a pen
 
 # ── Smoothing ─────────────────────────────────────────────────────────────────
-SMOOTH_ALPHA = 0.45   # EMA weight — higher = snappier, lower = smoother
-DEAD_ZONE    = 0.005  # normalised — kills micro-jitter
-FALLBACK_MAX = 10     # frames to hold last position on detection loss
+MEDIAN_WIN   = 5      # median of last N readings — rejects outlier blobs
+FALLBACK_MAX = 25     # frames (~0.4 s) to hold position after detection loss
+
+PRACTICE_SECS   = 10          # seconds of free-movement practice before ball launches
+PRACTICE_FRAMES = PRACTICE_SECS * (1000 // 16)   # ≈ 60 fps
 
 FRAME_MS = 16
 
@@ -109,6 +112,7 @@ def initial_state():
         },
         "score":        [0, 0],
         "phase":        "waiting",
+        "practice_frames": PRACTICE_FRAMES,
         "winner":       None,
         "pause_frames": 0,
         "p1_detected":  False,
@@ -116,8 +120,8 @@ def initial_state():
         "rally_hits":   0,
         "max_rally":    0,
         "serve_toward": 1,
-        "_p1_smooth":   None,
-        "_p2_smooth":   None,
+        "_p1_hist":     deque(maxlen=MEDIAN_WIN),
+        "_p2_hist":     deque(maxlen=MEDIAN_WIN),
         "_p1_fallback": 0,
         "_p2_fallback": 0,
     }
@@ -198,41 +202,34 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-def _smooth(prev, raw):
-    if prev is None:
-        return raw
-    delta = raw - prev
-    if abs(delta) < DEAD_ZONE:
-        return prev
-    return prev + SMOOTH_ALPHA * delta
-
-
 def update_paddles(state, y1, y2):
-    margin = 0.08          # reach top/bottom at ~8% from camera edge
+    # Only the central 50 % of camera height maps to the full paddle range.
+    # Pen never needs to go near the edges — small movement = full reach.
+    margin = 0.25
     span   = 1 - 2 * margin
 
-    def apply(raw_y, smooth_key, fallback_key, player_key, detected_key):
+    def apply(raw_y, hist_key, fallback_key, player_key, detected_key):
         if raw_y is not None:
-            state[smooth_key]   = _smooth(state[smooth_key], raw_y)
+            state[hist_key].append(raw_y)
             state[fallback_key] = FALLBACK_MAX
             state[detected_key] = True
         else:
             if state[fallback_key] > 0:
                 state[fallback_key] -= 1
-                state[detected_key]  = True
+                state[detected_key]  = True   # hold position during fallback
             else:
                 state[detected_key] = False
-                state[smooth_key]   = None
-                return
+                return                         # nothing to update
 
-        sy = state[smooth_key]
-        if sy is None:
+        if not state[hist_key]:
             return
-        frac = clamp((sy - margin) / span, 0.0, 1.0)
+        # Median of recent readings — outlier blobs don't move the paddle
+        smooth_y = float(np.median(state[hist_key]))
+        frac = clamp((smooth_y - margin) / span, 0.0, 1.0)
         state[player_key]["y"] = int(frac * (GAME_H - PADDLE_H))
 
-    apply(y1, "_p1_smooth", "_p1_fallback", "p1", "p1_detected")
-    apply(y2, "_p2_smooth", "_p2_fallback", "p2", "p2_detected")
+    apply(y1, "_p1_hist", "_p1_fallback", "p1", "p1_detected")
+    apply(y2, "_p2_hist", "_p2_fallback", "p2", "p2_detected")
 
 
 def _rally_speed(hits):
@@ -251,9 +248,9 @@ def move_ball(state):
     b["y"] += b["vy"]
 
     if b["y"] <= FIELD_TOP:
-        b["y"]  = float(FIELD_TOP);  b["vy"] = abs(b["vy"])
+        b["y"]  = float(FIELD_TOP);  b["vy"] = abs(b["vy"]);  sound_wall()
     elif b["y"] + BALL_SIZE >= FIELD_BOT:
-        b["y"]  = float(FIELD_BOT - BALL_SIZE);  b["vy"] = -abs(b["vy"])
+        b["y"]  = float(FIELD_BOT - BALL_SIZE);  b["vy"] = -abs(b["vy"]);  sound_wall()
 
     def paddle_hit(px, py, direction):
         state["rally_hits"] += 1
@@ -271,6 +268,7 @@ def move_ball(state):
             and b["y"] <= p1["y"] + PADDLE_H):
         b["x"] = p1["x"] + PADDLE_W + 1
         paddle_hit(p1["x"], p1["y"], +1)
+        sound_paddle()
 
     if (b["vx"] > 0
             and b["x"] + BALL_SIZE >= p2["x"]
@@ -279,14 +277,17 @@ def move_ball(state):
             and b["y"] <= p2["y"] + PADDLE_H):
         b["x"] = p2["x"] - BALL_SIZE - 1
         paddle_hit(p2["x"], p2["y"], -1)
+        sound_paddle()
 
     if b["x"] + BALL_SIZE < 0:
         state["score"][1]    += 1
         state["serve_toward"] = -1
+        sound_score()
         return "scored"
     if b["x"] > GAME_W:
         state["score"][0]    += 1
         state["serve_toward"] = 1
+        sound_score()
         return "scored"
     return "playing"
 
@@ -318,15 +319,15 @@ def draw_field(c):
     mid = GAME_W // 2
     cv2.rectangle(c, (0, 0),         (GAME_W, FIELD_TOP), BORDER_COL, -1)
     cv2.rectangle(c, (0, FIELD_BOT), (GAME_W, GAME_H),    BORDER_COL, -1)
-    cv2.rectangle(c, (0,   FIELD_TOP), (mid,    FIELD_BOT), GREEN_FIELD, -1)
-    cv2.rectangle(c, (mid, FIELD_TOP), (GAME_W, FIELD_BOT), RED_FIELD,   -1)
+    cv2.rectangle(c, (0,   FIELD_TOP), (mid,    FIELD_BOT), ORANGE_FIELD, -1)
+    cv2.rectangle(c, (mid, FIELD_TOP), (GAME_W, FIELD_BOT), BLUE_FIELD,   -1)
     strip = 18
     for i in range(strip):
         alpha = int(40 * (1 - i / strip))
-        col_g = (0, min(80+alpha,255), min(30+alpha//2,255))
-        col_r = (min(40+alpha,255), min(20+alpha//2,255), min(90+alpha,255))
-        cv2.line(c, (i,          FIELD_TOP), (i,          FIELD_BOT), col_g, 1)
-        cv2.line(c, (GAME_W-1-i, FIELD_TOP), (GAME_W-1-i, FIELD_BOT), col_r, 1)
+        col_o = (0, min(60+alpha,255), min(100+alpha,255))
+        col_b = (min(110+alpha,255), min(50+alpha//2,255), 10)
+        cv2.line(c, (i,          FIELD_TOP), (i,          FIELD_BOT), col_o, 1)
+        cv2.line(c, (GAME_W-1-i, FIELD_TOP), (GAME_W-1-i, FIELD_BOT), col_b, 1)
     cv2.line(c, (0, FIELD_TOP), (GAME_W, FIELD_TOP), WHITE, 2)
     cv2.line(c, (0, FIELD_BOT), (GAME_W, FIELD_BOT), WHITE, 2)
     x, y, dash, gap = mid-1, FIELD_TOP, 18, 12
@@ -335,8 +336,8 @@ def draw_field(c):
         y += dash + gap
     r = 5
     for px, py, col in [
-        (0, FIELD_TOP, GREEN), (mid-r, FIELD_TOP, WHITE), (mid+r, FIELD_TOP, WHITE), (GAME_W, FIELD_TOP, RED),
-        (0, FIELD_BOT, GREEN), (mid-r, FIELD_BOT, WHITE), (mid+r, FIELD_BOT, WHITE), (GAME_W, FIELD_BOT, RED),
+        (0, FIELD_TOP, ORANGE_BGR), (mid-r, FIELD_TOP, WHITE), (mid+r, FIELD_TOP, WHITE), (GAME_W, FIELD_TOP, BLUE_BGR),
+        (0, FIELD_BOT, ORANGE_BGR), (mid-r, FIELD_BOT, WHITE), (mid+r, FIELD_BOT, WHITE), (GAME_W, FIELD_BOT, BLUE_BGR),
     ]:
         cv2.circle(c, (px, py), r, col, -1)
 
@@ -347,10 +348,10 @@ def draw_score(c, score, rally_hits, max_rally):
     cy  = FIELD_TOP // 2 + 10
     s1  = str(score[0])
     (w1,h1),_ = cv2.getTextSize(s1, f, 1.8, 2)
-    cv2.putText(c, s1, (mid//2 - w1//2, cy+h1//2), f, 1.8, GREEN, 2, cv2.LINE_AA)
+    cv2.putText(c, s1, (mid//2 - w1//2, cy+h1//2), f, 1.8, ORANGE_BGR, 2, cv2.LINE_AA)
     s2  = str(score[1])
     (w2,h2),_ = cv2.getTextSize(s2, f, 1.8, 2)
-    cv2.putText(c, s2, (mid+mid//2-w2//2, cy+h2//2), f, 1.8, RED, 2, cv2.LINE_AA)
+    cv2.putText(c, s2, (mid+mid//2-w2//2, cy+h2//2), f, 1.8, BLUE_BGR, 2, cv2.LINE_AA)
     cv2.line(c, (mid,4), (mid, FIELD_TOP-4), (50,50,50), 1)
     bot_cy = FIELD_BOT + (GAME_H - FIELD_BOT) // 2
     rally_text = f"RALLY  {rally_hits}"
@@ -397,21 +398,25 @@ def render_game(state):
     draw_field(c)
     draw_score(c, state["score"], state["rally_hits"], state["max_rally"])
     p1, p2 = state["p1"], state["p2"]
-    draw_paddle(c, p1["x"], p1["y"], GREEN if state["p1_detected"] else GREY_LIGHT)
-    draw_paddle(c, p2["x"], p2["y"], RED   if state["p2_detected"] else GREY_LIGHT)
+    draw_paddle(c, p1["x"], p1["y"], ORANGE_BGR if state["p1_detected"] else GREY_LIGHT)
+    draw_paddle(c, p2["x"], p2["y"], BLUE_BGR   if state["p2_detected"] else GREY_LIGHT)
     if state["phase"] in ("playing", "scored"):
         b = state["ball"]
         draw_ball(c, int(b["x"]), int(b["y"]))
     if state["phase"] == "waiting":
         if not state["p1_detected"] and not state["p2_detected"]:
             draw_overlay(c, "Show both pens to camera",
-                            "P1 = orange pen   |   P2 = blue pen")
+                            "P1 = red pen   |   P2 = blue pen")
         elif not state["p1_detected"]:
-            draw_overlay(c, "P1: show your orange pen")
+            draw_overlay(c, "P1: show your red pen")
         elif not state["p2_detected"]:
             draw_overlay(c, "P2: show your blue pen")
         else:
             draw_overlay(c, "Get ready!", "Launching...")
+    elif state["phase"] == "practice":
+        secs_left = max(1, -(-state["practice_frames"] // (1000 // 16)))  # ceiling div
+        draw_overlay(c, f"Practice!  Ball launches in {secs_left}s",
+                        "Move your paddle up and down   |   SPACE to start now")
     elif state["phase"] == "scored":
         draw_overlay(c, "POINT!")
     elif state["phase"] == "won":
@@ -441,8 +446,8 @@ def render_cam(frame, mask1, mask2, state, p1_hue_high, p2_hue_high):
     ph_px = int(PADDLE_H / GAME_H * CAM_PREV_H)
     p1y   = int(state["p1"]["y"] / GAME_H * CAM_PREV_H)
     p2y   = int(state["p2"]["y"] / GAME_H * CAM_PREV_H)
-    cv2.rectangle(prev, (0,            p1y), (5,           p1y+ph_px), GREEN, -1)
-    cv2.rectangle(prev, (CAM_PREV_W-5, p2y), (CAM_PREV_W,  p2y+ph_px), RED,   -1)
+    cv2.rectangle(prev, (0,            p1y), (5,           p1y+ph_px), ORANGE_BGR, -1)
+    cv2.rectangle(prev, (CAM_PREV_W-5, p2y), (CAM_PREV_W,  p2y+ph_px), BLUE_BGR,   -1)
 
     # Hue readouts
     cv2.putText(prev, f"P1 hue max: {p1_hue_high}  (Q/A)",
@@ -452,9 +457,9 @@ def render_cam(frame, mask1, mask2, state, p1_hue_high, p2_hue_high):
 
     # Detected labels
     if state["p1_detected"]:
-        cv2.putText(prev, "P1 OK", (8, CAM_PREV_H-10), f, 0.55, GREEN, 1, cv2.LINE_AA)
+        cv2.putText(prev, "P1 OK", (8, CAM_PREV_H-10), f, 0.55, ORANGE_BGR, 1, cv2.LINE_AA)
     if state["p2_detected"]:
-        cv2.putText(prev, "P2 OK", (CAM_PREV_W-70, CAM_PREV_H-10), f, 0.55, RED, 1, cv2.LINE_AA)
+        cv2.putText(prev, "P2 OK", (CAM_PREV_W-70, CAM_PREV_H-10), f, 0.55, BLUE_BGR, 1, cv2.LINE_AA)
 
     return prev
 
@@ -481,7 +486,7 @@ def main():
     print("=" * 55)
     print("  PONG — Pen Edition")
     print("=" * 55)
-    print("  P1: hold an ORANGE or RED pen to the camera")
+    print("  P1: hold a RED pen to the camera")
     print("  P2: hold a BLUE pen to the camera")
     print("  Move the pen UP / DOWN to move your paddle.")
     print("  Q/A to tune P1 colour detection.")
@@ -500,15 +505,20 @@ def main():
         update_paddles(state, y1, y2)
         both = state["p1_detected"] and state["p2_detected"]
 
-        # ── Game logic (identical to pong_colours_physics.py) ─────────────
+        # ── Game logic ────────────────────────────────────────────────────
         if state["phase"] == "waiting":
             if both:
                 state["pause_frames"] += 1
                 if state["pause_frames"] >= 60:
                     state["pause_frames"] = 0
-                    state["phase"] = "playing"
+                    state["phase"] = "practice"
             else:
                 state["pause_frames"] = 0
+
+        elif state["phase"] == "practice":
+            state["practice_frames"] -= 1
+            if state["practice_frames"] <= 0:
+                state["phase"] = "playing"
 
         elif state["phase"] == "playing":
             result = move_ball(state)
@@ -540,11 +550,14 @@ def main():
 
         # ── Keys ──────────────────────────────────────────────────────────
         key = cv2.waitKey(FRAME_MS) & 0xFF
-        if   key == 27:          break                                    # ESC
-        elif key == ord('q'):    p1_hue_high = min(p1_hue_high + 1, 40)  # P1 hue up
-        elif key == ord('a'):    p1_hue_high = max(p1_hue_high - 1, 5)   # P1 hue down
-        elif key == ord('p'):    p2_hue_high = min(p2_hue_high + 1, 135) # P2 hue up
-        elif key == ord('l'):    p2_hue_high = max(p2_hue_high - 1, 95)  # P2 hue down
+        if   key == 27:          break                                          # ESC
+        elif key == 32:                                                         # SPACE — skip practice
+            if state["phase"] == "practice":
+                state["phase"] = "playing"
+        elif key == ord('q'):    p1_hue_high = min(p1_hue_high + 1, 40)
+        elif key == ord('a'):    p1_hue_high = max(p1_hue_high - 1, 5)
+        elif key == ord('p'):    p2_hue_high = min(p2_hue_high + 1, 135)
+        elif key == ord('l'):    p2_hue_high = max(p2_hue_high - 1, 95)
 
     cap.release()
     cv2.destroyAllWindows()
